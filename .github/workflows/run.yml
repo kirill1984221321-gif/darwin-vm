@@ -81,29 +81,51 @@ jobs:
           otool -L "$QEMU" | head -40
           echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix)/lib:$(brew --prefix)/opt/gettext/lib:$(brew --prefix)/opt/libslirp/lib" >> $GITHUB_ENV
 
-      # ===== ПРАВКА run.sh: убрать -nographic, добавить -vnc =====
-      - name: Prepare run.sh (fix VNC)
+      # ===== НОВЫЙ ШАГ: скачиваем отсутствующий keymap en-us =====
+      - name: Fix QEMU keymaps
+        working-directory: darwin-vm
+        run: |
+          KEYMAP_DIRS=$(find . -type d -name keymaps 2>/dev/null || true)
+          if [ -z "$KEYMAP_DIRS" ]; then
+            echo "Директории keymaps не найдены, создаём стандартную"
+            mkdir -p qemu-sptm/build/share/qemu/keymaps
+            KEYMAP_DIRS="qemu-sptm/build/share/qemu/keymaps"
+          fi
+          for dir in $KEYMAP_DIRS; do
+            if [ ! -f "$dir/en-us" ]; then
+              echo "Скачиваем en-us в $dir"
+              curl -L -o "$dir/en-us" "https://gitlab.com/qemu-project/qemu/-/raw/master/pc-bios/keymaps/en-us" || \
+              curl -L -o "$dir/en-us" "https://raw.githubusercontent.com/qemu/qemu/master/pc-bios/keymaps/en-us"
+            fi
+          done
+          echo "=== Содержимое keymaps ==="
+          for dir in $KEYMAP_DIRS; do
+            ls -la "$dir"
+          done
+
+      # ===== ПРАВКА run.sh: убрать -nographic, добавить -vnc, починить stty =====
+      - name: Prepare run.sh (fix VNC + stty)
         working-directory: darwin-vm
         run: |
           chmod +x run.sh *.sh 2>/dev/null || true
 
           # 1) Убираем строку с -nographic (она отключает VNC)
-          #    В вашем run.sh строка ровно такая: "        -nographic"
           sed -i '' '/^[[:space:]]*-nographic[[:space:]]*$/d' run.sh
 
           # 2) Добавляем -vnc 127.0.0.1:1 в массив args сразу после "-m 8G"
-          #    Через perl, потому что BSD sed не умеет \n во вставке
           if ! grep -q -- '-vnc' run.sh; then
             perl -0777 -pi -e 's/(-m 8G\n)/$1        -vnc 127.0.0.1:1\n/' run.sh
           fi
 
-          # 3) -serial mon:stdio оставляем как есть — он пишет логи QEMU в vm.log
+          # 3) Подавляем ошибку stty в неинтерактивном режиме
+          perl -pi -e 's/stty sane/stty sane 2>\/dev\/null || true/' run.sh
+
           echo "=== Итоговый run.sh ==="
           cat run.sh
 
           # Проверяем, что правка применилась
           grep -q -- '-vnc 127.0.0.1:1' run.sh || { echo "VNC arg NOT inserted"; exit 1; }
-          grep -q -- '-nographic' run.sh && { echo "nographic still present"; exit 1; } || true
+          if grep -q -- '-nographic' run.sh; then echo "nographic still present"; exit 1; fi
           echo "run.sh готов"
 
       - name: Silence SEP logs (optional)
@@ -133,18 +155,32 @@ jobs:
         working-directory: darwin-vm
         run: |
           nohup ./run.sh > vm.log 2>&1 &
-          echo "VM запущена, ждём VNC порт..."
+          QEMU_PID=$!
+          echo "VM запущена (PID=$QEMU_PID), ждём VNC порт (макс 120с)..."
 
-          for i in $(seq 1 60); do
-            if nc -z 127.0.0.1 5901; then
+          for i in $(seq 1 120); do
+            if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+              echo "!!! QEMU завершился на итерации $i — показываю лог:"
+              tail -200 vm.log
+              exit 1
+            fi
+
+            if nc -z 127.0.0.1 5901 2>/dev/null; then
               echo "VNC port OK (attempt $i)"
+              echo "=== Первые строки vm.log ==="
+              head -40 vm.log
               exit 0
+            fi
+
+            if [ $((i % 5)) -eq 0 ]; then
+              echo "--- ${i}s: VNC пока нет, хвост vm.log: ---"
+              tail -5 vm.log || true
             fi
             sleep 1
           done
 
-          echo "VNC failed после 60 секунд"
-          tail -100 vm.log
+          echo "VNC failed после 120 секунд"
+          tail -200 vm.log
           exit 1
 
       - name: Start noVNC web (port 6080)
