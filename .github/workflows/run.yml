@@ -80,30 +80,23 @@ jobs:
           echo "qemu at: $QEMU"
           otool -L "$QEMU" | head -40
 
-          # Диагностика: посмотрим, какой data-dir QEMU себе представляет
           echo "=== Возможные пути keymaps внутри бинарника ==="
           strings "$QEMU" 2>/dev/null | grep -i "keymaps" | head -20 || true
 
           echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix)/lib:$(brew --prefix)/opt/gettext/lib:$(brew --prefix)/opt/libslirp/lib" >> $GITHUB_ENV
 
-      # ===== ИСПРАВЛЕНО: кладём keymap в место, которое укажем через -L =====
       - name: Fetch QEMU keymaps
         working-directory: darwin-vm
         run: |
           mkdir -p qemu-data/keymaps
 
-          # Скачиваем en-us из официального репозитория QEMU
           curl -fSL -o qemu-data/keymaps/en-us \
             "https://raw.githubusercontent.com/qemu/qemu/master/pc-bios/keymaps/en-us"
 
-          # Проверяем, что файл валидный и непустой
           test -s qemu-data/keymaps/en-us || { echo "en-us не скачался или пустой"; exit 1; }
           echo "=== Размер en-us ==="
           ls -la qemu-data/keymaps/en-us
-          echo "=== Первые строки ==="
-          head -5 qemu-data/keymaps/en-us
 
-          # На случай, если -L не сработает, продублируем в "типовые" места
           for candidate in \
             "qemu-sptm/build/share/qemu/keymaps" \
             "qemu-sptm/share/qemu/keymaps" \
@@ -114,16 +107,15 @@ jobs:
           done
           echo "keymaps разложены"
 
-      # ===== ПРАВКА run.sh: -nographic off, -vnc и -L on, stty fix =====
       - name: Prepare run.sh (fix VNC + keymap path + stty)
         working-directory: darwin-vm
         run: |
           chmod +x run.sh *.sh 2>/dev/null || true
 
-          # 1) Убираем строку с -nographic (она отключает VNC)
+          # 1) Убираем -nographic
           sed -i '' '/^[[:space:]]*-nographic[[:space:]]*$/d' run.sh
 
-          # 2) Добавляем -L ./qemu-data и -vnc 127.0.0.1:1 в массив args после "-m 8G"
+          # 2) Добавляем -L ./qemu-data и -vnc 127.0.0.1:1 после "-m 8G"
           if ! grep -q -- '-vnc' run.sh; then
             perl -0777 -pi -e 's#(-m 8G\n)#$1        -L ./qemu-data\n        -vnc 127.0.0.1:1\n#' run.sh
           fi
@@ -134,7 +126,6 @@ jobs:
           echo "=== Итоговый run.sh ==="
           cat run.sh
 
-          # Проверки
           grep -q -- '-vnc 127.0.0.1:1' run.sh || { echo "VNC arg NOT inserted"; exit 1; }
           grep -q -- '-L ./qemu-data' run.sh  || { echo "-L arg NOT inserted"; exit 1; }
           if grep -q -- '-nographic' run.sh; then echo "nographic still present"; exit 1; fi
@@ -162,18 +153,6 @@ jobs:
           else
             echo "fix_perms.sh или ramdisk.dmg не найдены, пропускаем"
           fi
-
-      # ===== ПРОБНЫЙ ЗАПУСК: сначала проверяем, что keymap находится =====
-      - name: Sanity check QEMU keymap
-        working-directory: darwin-vm
-        run: |
-          # Пустой запуск QEMU только для проверки, что он найдёт keymap.
-          # Если увидим ту же ошибку — значит -L не туда смотрит.
-          timeout 10 ./qemu-sptm/build/qemu-system-aarch64 \
-            -L ./qemu-data \
-            -vnc 127.0.0.1:99 \
-            -M none -display none 2>&1 | head -20 || true
-          echo "--- Проверка завершена (это нормально, что QEMU выругается на -M none) ---"
 
       - name: Start QEMU VM
         working-directory: darwin-vm
@@ -207,11 +186,40 @@ jobs:
           tail -200 vm.log
           exit 1
 
-      - name: Start noVNC web (port 6080)
+      # ===== ИСПРАВЛЕНО: запускаем websockify напрямую, а не novnc_proxy =====
+      - name: Start noVNC web (websockify, port 6080)
         run: |
-          nohup python3 noVNC/utils/novnc_proxy --vnc 127.0.0.1:5901 --listen 6080 > novnc.log 2>&1 &
-          sleep 5
-          nc -z 127.0.0.1 6080 && echo "noVNC OK" || { echo "noVNC failed"; tail -50 novnc.log; exit 1; }
+          NOVNC_DIR="$GITHUB_WORKSPACE/noVNC"
+
+          # Проверяем, что websockify установлен
+          python3 -m websockify --help >/dev/null 2>&1 || {
+            echo "websockify не найден, ставлю ещё раз"
+            python3 -m pip install --break-system-packages websockify
+          }
+
+          # websockify: --web отдаёт статику noVNC, дальше проксирует WebSocket → TCP 5901
+          nohup python3 -m websockify --web "$NOVNC_DIR" 6080 127.0.0.1:5901 > novnc.log 2>&1 &
+          WS_PID=$!
+          echo "websockify PID=$WS_PID"
+
+          for i in $(seq 1 30); do
+            if ! kill -0 "$WS_PID" 2>/dev/null; then
+              echo "websockify упал:"
+              cat novnc.log
+              exit 1
+            fi
+            if nc -z 127.0.0.1 6080 2>/dev/null; then
+              echo "noVNC OK on http://127.0.0.1:6080/vnc.html (attempt $i)"
+              echo "=== Первые строки novnc.log ==="
+              head -20 novnc.log
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "noVNC не поднялся за 30 секунд"
+          cat novnc.log
+          exit 1
 
       # ===== TAILSCALE с AUTH KEY =====
       - name: Connect to Tailscale
@@ -228,7 +236,8 @@ jobs:
           tailscale status
           echo "=== Ваш Tailscale IP ==="
           tailscale ip -4
-          echo "=== VNC доступен на: <tailscale-ip>:5901 ==="
+          echo "=== noVNC (браузер): http://<tailscale-ip>:6080/vnc.html ==="
+          echo "=== VNC-клиент:        <tailscale-ip>:5901 ==="
 
       - name: Expose noVNC via Tailscale Serve
         run: |
@@ -252,6 +261,7 @@ jobs:
               tail -100 darwin-vm/vm.log
               exit 1
             }
+            nc -z 127.0.0.1 6080 || echo "WARN: noVNC порт умер"
             echo "[$(date -u +%H:%M:%S)] VM alive, tailscale IP: $(tailscale ip -4)"
           done
           echo "Время вышло, завершаем."
