@@ -1,4 +1,4 @@
-name: Run darwin-vm (deps + noVNC + VNC tunnel)
+name: Run darwin-vm (Tailscale + VNC)
 
 on:
   workflow_dispatch:
@@ -8,14 +8,28 @@ on:
         required: true
         default: "https://github.com/kirill1984221321-gif/darwin-vm/releases/download/1.00/darwin-vm-iPhone17.3.zip"
       run_hours:
-        description: "Сколько часов держать ВМ (макс 5.5)"
-        required: false
+        description: "Сколько часов держать ВМ (макс 5)"
+        required: true
+        type: choice
         default: "5"
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
+
+concurrency:
+  group: darwin-vm-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   run-vm:
     runs-on: macos-latest
     timeout-minutes: 355
+
+    permissions:
+      contents: read
 
     steps:
       - name: Download release
@@ -67,52 +81,117 @@ jobs:
           otool -L "$QEMU" | head -40
           echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix)/lib:$(brew --prefix)/opt/gettext/lib:$(brew --prefix)/opt/libslirp/lib" >> $GITHUB_ENV
 
-      - name: Prepare run.sh
+      # ===== ПРАВКА run.sh: убрать -nographic, добавить -vnc =====
+      - name: Prepare run.sh (fix VNC)
         working-directory: darwin-vm
         run: |
           chmod +x run.sh *.sh 2>/dev/null || true
-          grep -q "\-vnc" run.sh || sed -i '' 's/qemu-system-aarch64 /qemu-system-aarch64 -vnc 127.0.0.1:1 /' run.sh
+
+          # 1) Убираем строку с -nographic (она отключает VNC)
+          #    В вашем run.sh строка ровно такая: "        -nographic"
+          sed -i '' '/^[[:space:]]*-nographic[[:space:]]*$/d' run.sh
+
+          # 2) Добавляем -vnc 127.0.0.1:1 в массив args сразу после "-m 8G"
+          #    Через perl, потому что BSD sed не умеет \n во вставке
+          if ! grep -q -- '-vnc' run.sh; then
+            perl -0777 -pi -e 's/(-m 8G\n)/$1        -vnc 127.0.0.1:1\n/' run.sh
+          fi
+
+          # 3) -serial mon:stdio оставляем как есть — он пишет логи QEMU в vm.log
+          echo "=== Итоговый run.sh ==="
           cat run.sh
+
+          # Проверяем, что правка применилась
+          grep -q -- '-vnc 127.0.0.1:1' run.sh || { echo "VNC arg NOT inserted"; exit 1; }
+          grep -q -- '-nographic' run.sh && { echo "nographic still present"; exit 1; } || true
+          echo "run.sh готов"
+
+      - name: Silence SEP logs (optional)
+        working-directory: darwin-vm
+        run: |
+          if [ -f silence_logs.py ] && [ -f firmware/bootkc ]; then
+            chmod +x silence_logs.py
+            ./silence_logs.py firmware/bootkc \
+              0xfdb13 b'shared_region: %p [%d(%s)] check_np(0x%llx) vm_shared_region_start_address() returned 0x%x' \
+              0x6f7341 b'%s: %s: timed out waiting for AppleSEPManager (timeoutMs=%llu).' \
+              0xd19613 b'%s: %s(%d) \x00%s\n%s\x00%s' || echo "silence_logs.py предупредил, продолжаем"
+          else
+            echo "silence_logs.py или firmware/bootkc не найдены, пропускаем"
+          fi
+
+      - name: Fix ramdisk permissions
+        working-directory: darwin-vm
+        run: |
+          if [ -f fix_perms.sh ] && [ -f firmware/ramdisk.dmg ]; then
+            chmod +x fix_perms.sh
+            ./fix_perms.sh firmware/ramdisk.dmg || echo "fix_perms.sh завершился с предупреждением"
+          else
+            echo "fix_perms.sh или ramdisk.dmg не найдены, пропускаем"
+          fi
 
       - name: Start QEMU VM
         working-directory: darwin-vm
         run: |
           nohup ./run.sh > vm.log 2>&1 &
-          sleep 30
-          tail -50 vm.log
-          nc -z 127.0.0.1 5901 && echo "VNC port OK" || { echo "VNC failed"; tail -50 vm.log; exit 1; }
+          echo "VM запущена, ждём VNC порт..."
+
+          for i in $(seq 1 60); do
+            if nc -z 127.0.0.1 5901; then
+              echo "VNC port OK (attempt $i)"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "VNC failed после 60 секунд"
+          tail -100 vm.log
+          exit 1
 
       - name: Start noVNC web (port 6080)
         run: |
           nohup python3 noVNC/utils/novnc_proxy --vnc 127.0.0.1:5901 --listen 6080 > novnc.log 2>&1 &
           sleep 5
-          nc -z 127.0.0.1 6080 && echo "noVNC OK"
+          nc -z 127.0.0.1 6080 && echo "noVNC OK" || { echo "noVNC failed"; tail -50 novnc.log; exit 1; }
 
-      - name: Download cloudflared
-        run: |
-          curl -L -o cloudflared.tgz https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz
-          tar -xzf cloudflared.tgz
-          chmod +x cloudflared
+      # ===== TAILSCALE с AUTH KEY =====
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTH_KEY }}
+          tags: tag:ci
+          version: latest
 
-      - name: Tunnel 1 - noVNC web URL
+      - name: Enable Tailscale SSH (для отладки)
         run: |
-          nohup ./cloudflared tunnel --url http://127.0.0.1:6080 > tunnel-web.log 2>&1 &
-          sleep 15
-          WEB_URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' tunnel-web.log | head -1)
-          echo "=== САЙТ (браузер): $WEB_URL ==="
+          sudo tailscale set --ssh
+          echo "=== Tailscale status ==="
+          tailscale status
+          echo "=== Ваш Tailscale IP ==="
+          tailscale ip -4
+          echo "=== VNC доступен на: <tailscale-ip>:5901 ==="
 
-      - name: Tunnel 2 - raw TCP for VNC client
+      - name: Expose noVNC via Tailscale Serve
         run: |
-          nohup ./cloudflared tunnel --url tcp://127.0.0.1:5901 > tunnel-vnc.log 2>&1 &
-          sleep 15
-          VNC_URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' tunnel-vnc.log | head -1)
-          echo "=== VNC-клиент hostname: $VNC_URL ==="
-          echo "Подключение: cloudflared access tcp --hostname $VNC_URL --url 127.0.0.1:5900"
+          tailscale serve --bg --https=443 http://127.0.0.1:6080 || {
+            echo "Serve не удался, но VNC всё равно доступен по IP:5901"
+            tailscale serve status || true
+          }
+          echo "=== Tailscale Serve status ==="
+          tailscale serve status || true
 
       - name: Keep VM alive
         run: |
-          END=$((SECONDS + (${{ inputs.run_hours || 5 }}) * 3600))
+          HOURS=${{ inputs.run_hours }}
+          END=$((SECONDS + HOURS * 3600))
+          echo "Держим ВМ $HOURS ч (до ${END}s)"
+
           while [ $SECONDS -lt $END ]; do
             sleep 300
-            nc -z 127.0.0.1 5901 || { echo "VNC died"; tail -100 darwin-vm/vm.log; exit 1; }
+            nc -z 127.0.0.1 5901 || {
+              echo "VNC died"
+              tail -100 darwin-vm/vm.log
+              exit 1
+            }
+            echo "[$(date -u +%H:%M:%S)] VM alive, tailscale IP: $(tailscale ip -4)"
           done
+          echo "Время вышло, завершаем."
