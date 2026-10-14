@@ -1,0 +1,115 @@
+name: Run darwin-vm (deps + noVNC + VNC tunnel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_url:
+        description: "Ссылка на zip с релиза"
+        required: true
+        default: "https://github.com/kirill1984221321-gif/darwin-vm/releases/download/1.00/darwin-vm-iPhone17.3.zip"
+      run_hours:
+        description: "Сколько часов держать ВМ (макс 5.5)"
+        required: false
+        default: "5"
+
+jobs:
+  run-vm:
+    runs-on: macos-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Download release
+        run: |
+          curl -L -o vm.zip "${{ inputs.release_url }}"
+          unzip -o vm.zip -d darwin-vm
+          find darwin-vm -maxdepth 2 -type f | head -50
+
+      - name: Unpack inner tar.gz
+        run: |
+          # ищем вложенный архив и распаковываем рядом
+          TARFILE=$(find darwin-vm -name "*.tar.gz" | head -1)
+          if [ -n "$TARFILE" ]; then
+            echo "found inner archive: $TARFILE"
+            # если внутри лежит папка darwin-vm/..., распаковываем выше, чтобы get run.sh/firmware на месте
+            if tar -tzf "$TARFILE" | head -1 | grep -q '^darwin-vm/'; then
+              tar -xzf "$TARFILE" -C .
+            else
+              tar -xzf "$TARFILE" -C darwin-vm
+            fi
+          else
+            echo "no inner tar.gz, using zip contents as-is"
+          fi
+          # после распаковки run.sh должен лежать в ./darwin-vm (или уже там был)
+          ls -la darwin-vm/ | head -30
+
+      - name: Locate run.sh (safety)
+        run: |
+          # если структура вложенная, поднимаем нужное в darwin-vm/
+          if [ ! -f darwin-vm/run.sh ]; then
+            INNER=$(find . -name run.sh -not -path "./noVNC/*" | head -1)
+            echo "run.sh found at: $INNER"
+            DIRNAME=$(dirname "$INNER")
+            mkdir -p darwin-vm
+            cp -R "$DIRNAME"/firmware darwin-vm/ 2>/dev/null || true
+            cp "$DIRNAME"/run.sh darwin-vm/
+            cp "$DIRNAME"/qemu-system-aarch64 darwin-vm/ 2>/dev/null || \
+              find "$DIRNAME" -name qemu-system-aarch64 -exec cp {} darwin-vm/ \; 2>/dev/null || true
+          fi
+          test -f darwin-vm/run.sh || { echo "run.sh NOT FOUND"; exit 1; }
+          echo "run.sh OK"
+
+      - name: Install dependencies
+        run: |
+          brew install jq glib pixman gettext ninja python@3.12
+          python3 -m pip install --break-system-packages websockify
+          git clone https://github.com/novnc/noVNC.git
+
+      - name: Prepare run.sh
+        working-directory: darwin-vm
+        run: |
+          chmod +x run.sh *.sh 2>/dev/null || true
+          grep -q "\-vnc" run.sh || sed -i '' 's/qemu-system-aarch64 /qemu-system-aarch64 -vnc 127.0.0.1:1 /' run.sh
+          cat run.sh
+
+      - name: Start QEMU VM
+        working-directory: darwin-vm
+        run: |
+          nohup ./run.sh > vm.log 2>&1 &
+          sleep 30
+          tail -50 vm.log
+          nc -z 127.0.0.1 5901 && echo "VNC port OK"
+
+      - name: Start noVNC web (port 6080)
+        run: |
+          nohup python3 noVNC/utils/novnc_proxy --vnc 127.0.0.1:5901 --listen 6080 > novnc.log 2>&1 &
+          sleep 5
+          nc -z 127.0.0.1 6080 && echo "noVNC OK"
+
+      - name: Download cloudflared
+        run: |
+          curl -L -o cloudflared.tgz https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz
+          tar -xzf cloudflared.tgz
+          chmod +x cloudflared
+
+      - name: Tunnel 1 - noVNC web URL
+        run: |
+          nohup ./cloudflared tunnel --url http://127.0.0.1:6080 > tunnel-web.log 2>&1 &
+          sleep 15
+          WEB_URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' tunnel-web.log | head -1)
+          echo "=== САЙТ (браузер): $WEB_URL ==="
+
+      - name: Tunnel 2 - raw TCP for VNC client
+        run: |
+          nohup ./cloudflared tunnel --url tcp://127.0.0.1:5901 > tunnel-vnc.log 2>&1 &
+          sleep 15
+          VNC_URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' tunnel-vnc.log | head -1)
+          echo "=== VNC-клиент hostname: $VNC_URL ==="
+          echo "Подключение: cloudflared access tcp --hostname $VNC_URL --url 127.0.0.1:5900"
+
+      - name: Keep VM alive
+        run: |
+          END=$((SECONDS + (${{ inputs.run_hours || 5 }}) * 3600))
+          while [ $SECONDS -lt $END ]; do
+            sleep 300
+            nc -z 127.0.0.1 5901 || { echo "VNC died"; tail -100 darwin-vm/vm.log; exit 1; }
+          done
