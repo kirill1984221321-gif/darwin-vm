@@ -79,32 +79,43 @@ jobs:
           QEMU=$(find . -name qemu-system-aarch64 -type f | head -1)
           echo "qemu at: $QEMU"
           otool -L "$QEMU" | head -40
+
+          # Диагностика: посмотрим, какой data-dir QEMU себе представляет
+          echo "=== Возможные пути keymaps внутри бинарника ==="
+          strings "$QEMU" 2>/dev/null | grep -i "keymaps" | head -20 || true
+
           echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix)/lib:$(brew --prefix)/opt/gettext/lib:$(brew --prefix)/opt/libslirp/lib" >> $GITHUB_ENV
 
-      # ===== НОВЫЙ ШАГ: скачиваем отсутствующий keymap en-us =====
-      - name: Fix QEMU keymaps
+      # ===== ИСПРАВЛЕНО: кладём keymap в место, которое укажем через -L =====
+      - name: Fetch QEMU keymaps
         working-directory: darwin-vm
         run: |
-          KEYMAP_DIRS=$(find . -type d -name keymaps 2>/dev/null || true)
-          if [ -z "$KEYMAP_DIRS" ]; then
-            echo "Директории keymaps не найдены, создаём стандартную"
-            mkdir -p qemu-sptm/build/share/qemu/keymaps
-            KEYMAP_DIRS="qemu-sptm/build/share/qemu/keymaps"
-          fi
-          for dir in $KEYMAP_DIRS; do
-            if [ ! -f "$dir/en-us" ]; then
-              echo "Скачиваем en-us в $dir"
-              curl -L -o "$dir/en-us" "https://gitlab.com/qemu-project/qemu/-/raw/master/pc-bios/keymaps/en-us" || \
-              curl -L -o "$dir/en-us" "https://raw.githubusercontent.com/qemu/qemu/master/pc-bios/keymaps/en-us"
-            fi
-          done
-          echo "=== Содержимое keymaps ==="
-          for dir in $KEYMAP_DIRS; do
-            ls -la "$dir"
-          done
+          mkdir -p qemu-data/keymaps
 
-      # ===== ПРАВКА run.sh: убрать -nographic, добавить -vnc, починить stty =====
-      - name: Prepare run.sh (fix VNC + stty)
+          # Скачиваем en-us из официального репозитория QEMU
+          curl -fSL -o qemu-data/keymaps/en-us \
+            "https://raw.githubusercontent.com/qemu/qemu/master/pc-bios/keymaps/en-us"
+
+          # Проверяем, что файл валидный и непустой
+          test -s qemu-data/keymaps/en-us || { echo "en-us не скачался или пустой"; exit 1; }
+          echo "=== Размер en-us ==="
+          ls -la qemu-data/keymaps/en-us
+          echo "=== Первые строки ==="
+          head -5 qemu-data/keymaps/en-us
+
+          # На случай, если -L не сработает, продублируем в "типовые" места
+          for candidate in \
+            "qemu-sptm/build/share/qemu/keymaps" \
+            "qemu-sptm/share/qemu/keymaps" \
+            "share/qemu/keymaps" \
+            "qemu-sptm/build/pc-bios/keymaps"; do
+            mkdir -p "$candidate"
+            cp qemu-data/keymaps/en-us "$candidate/en-us"
+          done
+          echo "keymaps разложены"
+
+      # ===== ПРАВКА run.sh: -nographic off, -vnc и -L on, stty fix =====
+      - name: Prepare run.sh (fix VNC + keymap path + stty)
         working-directory: darwin-vm
         run: |
           chmod +x run.sh *.sh 2>/dev/null || true
@@ -112,9 +123,9 @@ jobs:
           # 1) Убираем строку с -nographic (она отключает VNC)
           sed -i '' '/^[[:space:]]*-nographic[[:space:]]*$/d' run.sh
 
-          # 2) Добавляем -vnc 127.0.0.1:1 в массив args сразу после "-m 8G"
+          # 2) Добавляем -L ./qemu-data и -vnc 127.0.0.1:1 в массив args после "-m 8G"
           if ! grep -q -- '-vnc' run.sh; then
-            perl -0777 -pi -e 's/(-m 8G\n)/$1        -vnc 127.0.0.1:1\n/' run.sh
+            perl -0777 -pi -e 's#(-m 8G\n)#$1        -L ./qemu-data\n        -vnc 127.0.0.1:1\n#' run.sh
           fi
 
           # 3) Подавляем ошибку stty в неинтерактивном режиме
@@ -123,8 +134,9 @@ jobs:
           echo "=== Итоговый run.sh ==="
           cat run.sh
 
-          # Проверяем, что правка применилась
+          # Проверки
           grep -q -- '-vnc 127.0.0.1:1' run.sh || { echo "VNC arg NOT inserted"; exit 1; }
+          grep -q -- '-L ./qemu-data' run.sh  || { echo "-L arg NOT inserted"; exit 1; }
           if grep -q -- '-nographic' run.sh; then echo "nographic still present"; exit 1; fi
           echo "run.sh готов"
 
@@ -150,6 +162,18 @@ jobs:
           else
             echo "fix_perms.sh или ramdisk.dmg не найдены, пропускаем"
           fi
+
+      # ===== ПРОБНЫЙ ЗАПУСК: сначала проверяем, что keymap находится =====
+      - name: Sanity check QEMU keymap
+        working-directory: darwin-vm
+        run: |
+          # Пустой запуск QEMU только для проверки, что он найдёт keymap.
+          # Если увидим ту же ошибку — значит -L не туда смотрит.
+          timeout 10 ./qemu-sptm/build/qemu-system-aarch64 \
+            -L ./qemu-data \
+            -vnc 127.0.0.1:99 \
+            -M none -display none 2>&1 | head -20 || true
+          echo "--- Проверка завершена (это нормально, что QEMU выругается на -M none) ---"
 
       - name: Start QEMU VM
         working-directory: darwin-vm
