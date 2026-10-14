@@ -1,0 +1,88 @@
+name: Build darwin-vm
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Модель девайса (iPhone17,3 = iPhone 16, дефолт скрипта)"
+        required: false
+        default: "iPhone17,3"
+      ipsw_url:
+        description: "Прямая ссылка на Restore.ipsw (пусто = дефолт из скрипта)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: macos-latest   # только macOS: patch_ramdisk требует hdiutil/codesign
+    timeout-minutes: 240
+
+    env:
+      DEVNAME: ${{ inputs.device || 'iPhone17,3' }}
+      URL: ${{ inputs.ipsw_url }}
+
+    steps:
+      - name: Install deps
+        run: brew install jq ipsw
+
+      - name: Clone darwin-vm
+        run: git clone --recurse-submodules https://github.com/jprx/darwin-vm.git
+
+      - name: Show repo layout
+        working-directory: darwin-vm
+        run: ls -la
+
+      - name: Fix build_tc.py entrypoint if broken
+        working-directory: darwin-vm
+        run: |
+          sed -i '' 's/^if name=="main":/if __name__ == "__main__":/' build_tc.py
+          python3 -c "import ast; ast.parse(open('build_tc.py').read())" && echo "build_tc.py OK"
+
+      - name: Make scripts executable
+        working-directory: darwin-vm
+        run: chmod +x *.sh *.py 2>/dev/null || chmod +x *.sh
+
+      - name: Get firmware + patched ramdisk
+        working-directory: darwin-vm
+        run: ./get_files.sh
+
+      - name: Verify ramdisk patched
+        working-directory: darwin-vm
+        run: |
+          test -f firmware/ramdisk.dmg || { echo "ramdisk.dmg missing"; exit 1; }
+          test -f firmware/ramdisk.tc || { echo "ramdisk.tc missing, ramdisk not patched"; exit 1; }
+          echo "ramdisk + trustcache OK"
+
+      - name: Fix perms
+        working-directory: darwin-vm
+        run: |
+          yes y | ./fix_perms.sh firmware/ramdisk.dmg
+
+      - name: Build QEMU (sptm)
+        working-directory: darwin-vm/qemu-sptm
+        run: |
+          git submodule update --init --recursive || true
+          mkdir -p build && cd build
+          ../configure --target-list=aarch64-softmmu \
+                       --disable-pvg \
+                       --disable-guest-agent \
+                       --enable-slirp
+          make -j"$(sysctl -n hw.ncpu)"
+
+      - name: Verify QEMU binary
+        run: test -x darwin-vm/qemu-sptm/build/qemu-system-aarch64
+
+      - name: Pack artifact
+        run: |
+          tar -czf darwin-vm-${{ inputs.device }}.tar.gz \
+              -C darwin-vm \
+              run.sh \
+              firmware \
+              qemu-sptm/build/qemu-system-aarch64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: darwin-vm-${{ inputs.device || 'iPhone17,3' }}
+          path: darwin-vm-*.tar.gz
+          retention-days: 30
